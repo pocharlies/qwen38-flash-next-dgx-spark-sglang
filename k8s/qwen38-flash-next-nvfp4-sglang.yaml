@@ -401,10 +401,15 @@ spec:
             - { name: CHUNKED_PREFILL_SIZE, value: "2048" }
             # Covers 16 running with margin for the NEXTN tree shapes.
             - { name: CUDA_GRAPH_MAX_BS, value: "32" }
-            # Empty = flag absent. Fill in once the qwen4_exp build confirms
-            # the parser names (candidates: qwen3 / qwen).
-            - { name: REASONING_PARSER, value: "" }
-            - { name: TOOL_CALL_PARSER, value: "" }
+            # Verified in production: `qwen3` matches the conditional <think>
+            # detector (same as vLLM's `qwen3` parser) and the checkpoint's
+            # chat template emits XML tool calls (<function=/<parameter=), so
+            # the right tool parser is `qwen3_coder` — the JSON `qwen`/`qwen25`
+            # detectors would parse nothing. sglang#36537 (thinking +
+            # qwen3_coder looping) did NOT reproduce on this build: thinking,
+            # tools, thinking+tools and streaming all tested clean.
+            - { name: REASONING_PARSER, value: "qwen3" }
+            - { name: TOOL_CALL_PARSER, value: "qwen3_coder" }
             # Bounds the host-side spike of CUDA graph capture. Without this,
             # inductor spawns ~1 compile worker per core (20) and the
             # 20-40 GB spike kills the cgroup 30-90 s after "Capture begin".
@@ -578,8 +583,9 @@ spec:
             - { name: MAMBA_TRACK_INTERVAL, value: "64" }
             - { name: CHUNKED_PREFILL_SIZE, value: "2048" }
             - { name: CUDA_GRAPH_MAX_BS, value: "32" }
-            - { name: REASONING_PARSER, value: "" }
-            - { name: TOOL_CALL_PARSER, value: "" }
+            # See the parser note on the head (same values, verified).
+            - { name: REASONING_PARSER, value: "qwen3" }
+            - { name: TOOL_CALL_PARSER, value: "qwen3_coder" }
             # See the head for the rationale of these two.
             - { name: TORCHINDUCTOR_COMPILE_THREADS, value: "4" }
             - { name: MAX_JOBS, value: "1" }

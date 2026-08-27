@@ -109,6 +109,11 @@ should leave ~33–35 GB.
   reclaim storm). Avoid large concurrent downloads.
 - Metrics come with the `sglang:*` prefix (including
   `sglang:spec_accept_length` to watch the speculative decoding).
+- Parsers verified in production: `--reasoning-parser qwen3` and
+  `--tool-call-parser qwen3_coder` (the template emits XML tool calls).
+  Reasoning arrives in `reasoning_content`, tool calls come structured, and
+  sglang#36537 (thinking + qwen3_coder looping) did not reproduce on this
+  build — tested with thinking, tools, both combined, and streaming.
 
 ## Sampling and thinking controls (from the official model card)
 
