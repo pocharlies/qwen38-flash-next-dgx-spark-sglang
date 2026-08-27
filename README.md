@@ -1,4 +1,7 @@
 ---
+# The recipe itself (docs, manifests, Dockerfile) is Apache-2.0. The model
+# weights it deploys are under the Qwen Community License 1.0 — see the base
+# model card.
 license: apache-2.0
 base_model: RadixArk/Qwen3.8-Flash-Next-NVFP4
 tags:
@@ -60,7 +63,7 @@ sm_121a (GB10) verification**.
 | `--mem-fraction-static` | **0.78** | With 0.85 the boot dies OOM during CUDA graph capture. On GB10 the GPU memory IS system memory: the pinned static pool plus the host-side compilation spike cross the cgroup limit (and with less margin, they take down the whole node). |
 | `MAX_JOBS` | **1** | The flashinfer JIT compiles the FP4 fused_moe kernels with nvcc via ninja, which defaults to one job per core. **A single cutlass FP4 `cicc` reaches 7.7 GB of RSS**: 20 in parallel = global node OOM. With 1, the spike stays around ~8 GB. Only the first capture is affected: the JIT cache persists. |
 | `TORCHINDUCTOR_COMPILE_THREADS` | 4 | Bounds inductor's compile workers during capture. |
-| `--page-size` | 64 | Mandatory: QSA (sparse attention) works in 64-token micro-blocks. |
+| `--page-size` | 64 | Mandatory: QSA (sparse attention) selects at micro-block level, 64-token blocks with a budget of 512 blocks / 2048 tokens per query (model card). |
 | `--mamba-scheduler-strategy extra_buffer` + `--mamba-track-interval 64` | — | Mandatory for the radix cache over the hybrid GDN state. |
 | NEXTN MTP | steps=3, topk=1, draft=4 | Measured accept length ~2.3. Switchable with `ENABLE_MTP=false` without touching the image. |
 | `--chunked-prefill-size` | 2048 | A long prefill sinks concurrent decodes on this hardware. |
@@ -106,6 +109,79 @@ should leave ~33–35 GB.
   reclaim storm). Avoid large concurrent downloads.
 - Metrics come with the `sglang:*` prefix (including
   `sglang:spec_accept_length` to watch the speculative decoding).
+
+## Sampling and thinking controls (from the official model card)
+
+The model **thinks by default**, emitting `<think>\n...</think>\n\n` before
+the final answer. Recommended sampling, per mode:
+
+| Mode | temperature | top_p | top_k | min_p | presence_penalty | repetition_penalty |
+|---|---|---|---|---|---|---|
+| Thinking | 1.0 | 0.95 | 20 | 0.0 | 0.0 | 1.0 |
+| Instruct (non-thinking) | 0.7 | 0.80 | 20 | 0.0 | 1.5 | 1.0 |
+
+`presence_penalty` can be raised between 0 and 2 to curb endless repetition,
+at the cost of occasional language mixing and a slight quality drop.
+
+Thinking behaviour is controlled through the chat template (works through any
+OpenAI-compatible gateway via `chat_template_kwargs`):
+
+- `enable_thinking: false` — direct answers, no `<think>` block.
+- `preserve_thinking` (default **true**) — keeps the thinking blocks of ALL
+  previous turns in the prompt. This is deliberate: it maximises decision
+  consistency in agents and radix/KV-cache reuse. Set it to `false` to keep
+  only the latest turn's thinking.
+- `reasoning_effort` — supported levels: `xhigh`, `medium`, `low`. Note from
+  the card, confirmed by our agent experience: in multi-turn agentic tasks a
+  LOWER effort does not necessarily lower total task time — weaker analysis
+  causes failures and retries that cost more than the faster turns save.
+
+For agentic workloads the card recommends generous output budgets (reasoning
+up to 262,144 tokens and final response up to 131,072 where the serving stack
+splits the two). Size your gateway's `max_output_tokens` accordingly — our
+deployment uses a much smaller cap and it is a deliberate trade-off, not a
+model limit.
+
+## Extending context beyond 256K (YaRN)
+
+We deliberately run at the native 262,144 (static YaRN penalises short
+contexts, and on 2× GB10 there is no memory for the 1M KV pool anyway). If
+you need more, the official recipe is to change `rope_parameters` inside
+`text_config` in `config.json`:
+
+```json
+{
+  "mrope_interleaved": true,
+  "mrope_section": [11, 11, 10],
+  "rope_type": "yarn",
+  "rope_theta": 10000000,
+  "partial_rotary_factor": 0.25,
+  "factor": 4.0,
+  "original_max_position_embeddings": 262144
+}
+```
+
+Set `factor` to what you actually need (e.g. 2.0 for 512K): all open-source
+frameworks implement *static* YaRN, so an oversized factor degrades short
+prompts all the time.
+
+## Vision and video
+
+Attention/GDN/vision run in BF16 in this checkpoint, so the multimodal path
+is intact. For hour-scale video the card recommends raising `longest_edge`
+in `video_preprocessor_config.json` to `469762048` (≈224k video tokens);
+see sglang PR #18467 for engine-side overrides. We have not benchmarked video
+on the 2× Spark setup — budget KV accordingly before trying.
+
+## Alternative: one Spark, GGUF
+
+If you have a single DGX Spark (or want CPU offload of the 51 GB n-gram PLE),
+the [Unsloth Dynamic GGUFs](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)
+run through their [llama.cpp PR ggml-org/llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742)
+(the n-gram embedding is exactly the kind of parameter mass that offloads
+well — it is indexed, not scanned). That path trades our TP=2 throughput and
+native FP4 experts for a one-box setup; this recipe is the full-quality,
+full-context two-node route.
 
 ## Full troubleshooting
 
