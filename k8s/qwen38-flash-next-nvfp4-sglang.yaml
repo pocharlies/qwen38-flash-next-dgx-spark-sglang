@@ -1,68 +1,66 @@
-# Qwen3.8-Flash-Next NVFP4 (125B MoE / 6B activos + 51B PLE n-gram + 4B MTP) en
-# TP=2 REPARTIDO ENTRE LOS DOS SPARKS, sobre el MISMO enlace RoCE 200G directo
-# que DeepSeek. Candidato a residente del perfil `llm-tp` (tier `tooling`).
+# Qwen3.8-Flash-Next NVFP4 (125B MoE / 6B active + 51B n-gram PLE + 4B MTP)
+# in TP=2 SPLIT ACROSS TWO NVIDIA DGX SPARK (GB10) NODES over a direct
+# 200G DAC link running RoCEv2.
 #
 # Checkpoint: RadixArk/Qwen3.8-Flash-Next-NVFP4 (135 GB, 206 safetensors).
-#   NVFP4 W4A4 SOLO en los expertos routed (48 capas x 512 expertos); atencion,
-#   GDN, shared expert, routers, vision y los 31 tensores de MTP quedan BF16
-#   byte-identicos al original -> la especulacion NEXTN funciona igual que en
-#   BF16. Las tablas PLE van FP8 en disco (51 GB).
-#   Runtime soportado por la ficha: SGLang con build `qwen4_exp`. vLLM NO carga
-#   este layout (expertos-only NVFP4 + PLE FP8 en shards aparte).
+#   NVFP4 W4A4 ONLY on the routed experts (48 layers x 512 experts);
+#   attention, GDN, shared expert, routers, vision and the 31 MTP tensors stay
+#   BF16, byte-identical to the original -> NEXTN speculation works exactly as
+#   in BF16. The PLE tables are FP8 on disk (51 GB).
+#   Supported runtime per the model card: SGLang with the `qwen4_exp` build.
+#   vLLM does NOT load this layout (experts-only NVFP4 + FP8 PLE in separate
+#   shards).
 #
-# DECISIONES OPERATIVAS (26-08-2026, aprobadas):
-#   - contexto 262144 (256K nativo, sin YaRN: no hay memoria para el pool de 1M
-#     y el YaRN estatico penaliza contextos cortos)
-#   - max-running-requests 16, mem-fraction-static 0.85
-#   - MTP NEXTN steps=3 / topk=1 / draft=4, conmutable con ENABLE_MTP=false
-#     SIN tocar la imagen (es el fallback si NEXTN+hibrido+FP4 da guerra)
-#   - chunked-prefill 2048 y no 4096: leccion medida en DeepSeek — un prefill
-#     largo hunde los decodes concurrentes (mediana 2-5 tok/s con running>=2)
-#   - page-size 64 y flags mamba: OBLIGATORIOS. QSA trabaja en micro-bloques de
-#     64; el radix cache sobre el estado GDN necesita extra_buffer + tracking.
-#   - DeepSeek queda en Git y en disco como ROLLBACK (~10 min de ciclo de perfil).
+# OPERATIONAL DECISIONS (validated in production):
+#   - context 262144 (native 256K, no YaRN: there is no memory for the 1M pool
+#     and static YaRN penalises short contexts)
+#   - max-running-requests 16, mem-fraction-static 0.78 (see the OOM note on
+#     the head Deployment: 0.85 dies during CUDA graph capture)
+#   - MTP NEXTN steps=3 / topk=1 / draft=4, switchable with ENABLE_MTP=false
+#     WITHOUT touching the image (first fallback if NEXTN + hybrid GDN + FP4
+#     misbehaves on a given build)
+#   - chunked-prefill 2048 and not 4096: measured lesson — one long prefill
+#     sinks the concurrent decodes (median 2-5 tok/s with running>=2)
+#   - page-size 64 and the mamba flags: MANDATORY. QSA works in 64-token
+#     micro-blocks; the radix cache over the GDN state needs extra_buffer +
+#     tracking.
 #
-# GO/NO-GO DE MEMORIA (medir en el PRIMER arranque, no asumir):
-#   0.85 * ~119.7 GiB = ~101.7 GiB para pesos+KV por rank.
-#   - Si el runtime mantiene el PLE en FP8: ~70-75 GiB de pesos -> pool KV
-#     ~27-31 GiB/rank (~2.3M tokens agregados a 12 KB/token/rank). Sobrado.
-#   - Si el PLE se decuantiza a BF16 al cargar (lo que dice la ficha RadixArk):
-#     ~95-100 GiB de pesos -> pool 2-7 GiB/rank. Arranca al filo o no arranca.
-#     En ese caso NO bajar contexto a ciegas: confirmar primero con el RSS y la
-#     linea "KV cache pool" del log, y decidir (issue upstream para PLE FP8
-#     nativo, o esperar NVFP4 oficial de Qwen).
-#   El KV de este modelo es minusculo: solo 12 de 48 capas tienen KV
-#   (2 KV heads x 256 dim -> 24 KB/token total, 12 KB/token/rank en TP=2).
-#   Estado GDN: ~27 MB/secuencia/rank, fijo. Con 16 concurrentes, despreciable.
+# MEMORY GO/NO-GO (measure on the FIRST boot, do not assume):
+#   0.78 * ~119.7 GiB = ~93 GiB for weights+KV per rank.
+#   - If the runtime keeps the PLE in FP8: ~70-75 GiB of weights -> KV pool
+#     is plenty. This is what we MEASURED on sm_121a: weights ~74 GiB/rank,
+#     "Load weight end ... avail mem" ~33-35 GB.
+#   - If the PLE dequantises to BF16 on load (what the RadixArk card says):
+#     ~95-100 GiB of weights -> it boots on the edge or not at all. In that
+#     case do NOT blindly lower the context: confirm with the RSS and the
+#     "KV cache pool" log line first.
+#   The KV of this model is tiny: only 12 of 48 layers have KV
+#   (2 KV heads x 256 dim -> 24 KB/token total, 12 KB/token/rank in TP=2).
+#   GDN state: ~27 MB/sequence/rank, fixed.
 #
-# IMAGEN: REGISTRY/sglang-qwen38next-arm64:v0.1.0
-#   NO EXISTE TODAVIA — la publica la Fase 1a (ver
-#   analysis/qwen38-flash-next-nvfp4/image/Dockerfile). Requisitos: SGLang con
-#   `qwen4_exp` + quant `modelopt_fp4` + flashinfer con kernels NVFP4 para
-#   sm_121a, aarch64. El NVFP4 de RadixArk esta validado solo en GB300/B300:
-#   sm_121 es NUESTRA verificacion. Mergear este fichero no despliega nada:
-#   replicas 0 y los deployments aun no estan en COMPONENTS del compute_mode.
+# IMAGE: REGISTRY/sglang-qwen38next-arm64:v0.1.0 (see image/Dockerfile).
+#   Requirements: SGLang with `qwen4_exp` + quant `modelopt_fp4` + flashinfer
+#   with NVFP4 kernels for sm_121a, aarch64. The RadixArk NVFP4 checkpoint is
+#   validated upstream only on GB300/B300: sm_121 is OUR verification.
 #
-# NUNCA levantar esto con DeepSeek arriba: mismos nodos (memoria) y mismo
-# puerto 8888 en hostNetwork en gx10-ec3d. El switch lo hace el selector del
-# dashboard cuando la Fase 2 registre estos deployments como residentes llm-tp.
+# NEVER run this next to another large model on the same nodes: same unified
+# memory and same port 8888 on hostNetwork.
 #
-# Topologia identica a DeepSeek (deepseek-v4-flash-0731-dspark.yaml):
-#   head  = rank 0 en gx10-ec3d  (10.0.0.2), unico que expone /v1 y /metrics
-#   worker= rank 1 en nvidia-dgx (10.0.0.1), sin HTTP: su salud se ve en el head
-#   NCCL por rocep1s0f0 / enp1s0f0np0 (el puerto f1 NO tiene cable), guards
-#   fail-closed de enlace y GID heredados del launch de DeepSeek.
-#   Pesos: UNA copia en nvidia-dgx; el head los lee por el PV NFS-RDMA
-#   hf-cache-nvidia-dgx-ro (5.5 GB/s medidos). Primer arranque: ~135 GB de
-#   carga + grafos CUDA -> startupProbe de 60 min, como DeepSeek.
-#   dist-init 10.0.0.2:25100 (25000 es el de DeepSeek; distinto a proposito
-#   para que un rollback a medias no cruce rendezvous).
+# Topology:
+#   head  = rank 0 on node SPARK_HEAD  (10.0.0.2), the only rank exposing /v1
+#           and /metrics
+#   worker= rank 1 on node SPARK_WORKER (10.0.0.1), no HTTP: its health shows
+#           up through the head
+#   NCCL over rocep1s0f0 / enp1s0f0np0 (adjust to your NIC), fail-closed link
+#   and GID guards in launch.sh.
+#   Weights: ONE copy on the worker node; the head reads them over NFS
+#   (NFS-RDMA over the same link measured at 5.5 GB/s). First boot: ~135 GB
+#   load + CUDA graph capture + cold JIT -> 60-minute startupProbe.
 #
-# Sampling recomendado por Qwen (se aplica en LiteLLM por familia, Fase 2c):
+# Sampling recommended by Qwen (apply it in your gateway, per model family):
 #   thinking t=1.0/top_p=0.95/top_k=20 ; instruct t=0.7/top_p=0.8/presence=1.5.
-#   El chat_template.jinja va DENTRO del checkpoint; preserve_thinking=ON por
-#   defecto es lo que maximiza hits del radix cache en agentes. No se replica
-#   aqui el DEFAULT_THINKING de DeepSeek: eso vive en LiteLLM.
+#   The chat_template.jinja ships INSIDE the checkpoint; preserve_thinking=ON
+#   by default is what maximises radix-cache hits for agents.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -70,9 +68,9 @@ metadata:
   name: qwen38-flash-next-sglang-launch
   namespace: llm
 data:
-  # Verifica el checkpoint contra su propio index (sin totales hardcodeados:
-  # el index es la fuente de verdad) y publica la ruta del snapshot para el
-  # contenedor principal via /shared/snapshot_dir.
+  # Verifies the checkpoint against its own index (no hardcoded totals: the
+  # index is the source of truth) and publishes the snapshot path for the main
+  # container via /shared/snapshot_dir.
   verify_checkpoint.py: |
     import json, os, sys
     from pathlib import Path
@@ -80,20 +78,20 @@ data:
     hub = Path(os.environ["HF_HOME"]) / "hub" / os.environ["QWEN_REPO_DIR"] / "snapshots"
     rev = os.environ.get("QWEN_REVISION", "").strip()
     if not hub.is_dir():
-        sys.exit(f"ABORTA: no existe {hub} (falta la descarga; ver analysis/qwen38-flash-next-nvfp4/job-download.yaml)")
+        sys.exit(f"ABORT: {hub} does not exist (download the checkpoint first)")
     if rev:
         snap = hub / rev
         if not snap.is_dir():
-            sys.exit(f"ABORTA: snapshot pinneado {rev} no existe en {hub}")
+            sys.exit(f"ABORT: pinned snapshot {rev} does not exist in {hub}")
     else:
         snaps = sorted(p for p in hub.iterdir() if p.is_dir())
         if len(snaps) != 1:
-            sys.exit(f"ABORTA: QWEN_REVISION vacio y hay {len(snaps)} snapshots en {hub}: pinnear la revision")
+            sys.exit(f"ABORT: QWEN_REVISION is empty and there are {len(snaps)} snapshots in {hub}: pin the revision")
         snap = snaps[0]
 
     index = snap / "model.safetensors.index.json"
     if not index.is_file():
-        sys.exit(f"ABORTA: falta {index}")
+        sys.exit(f"ABORT: missing {index}")
     weight_files = sorted(set(json.loads(index.read_text())["weight_map"].values()))
     missing, total = [], 0
     for name in weight_files:
@@ -110,11 +108,11 @@ data:
         if not (snap / extra).is_file():
             missing.append(extra)
     if missing:
-        sys.exit(f"ABORTA: {len(missing)} ficheros ausentes/vacios, p.ej. {missing[:5]}")
-    # 135 GB nominales; 130e9 deja margen a variaciones de shard sin dejar pasar
-    # una descarga a medias.
+        sys.exit(f"ABORT: {len(missing)} files missing/empty, e.g. {missing[:5]}")
+    # 135 GB nominal; 130e9 leaves margin for shard variations without letting
+    # a half-finished download through.
     if total < 130e9:
-        sys.exit(f"ABORTA: solo {total/1e9:.1f} GB de pesos; descarga incompleta")
+        sys.exit(f"ABORT: only {total/1e9:.1f} GB of weights; incomplete download")
     Path("/shared/snapshot_dir").write_text(str(snap))
     print(f"CHECKPOINT OK: {snap.name} · {len(weight_files)} shards · {total/1e9:.1f} GB")
 
@@ -122,25 +120,25 @@ data:
     set -euo pipefail
     MODEL_DIR="$(cat /shared/snapshot_dir)"
 
-    # --- Enlace 200G: fail-closed antes de tocar NCCL -------------------------
-    # Heredado del launch de DeepSeek: con el cable suelto o la IP RoCE ausente,
-    # NCCL_NET=IB no cae a LAN — se queda en deadlock MUDO tras la carga de
-    # pesos. Morir aqui, antes y con causa, es la garantia.
-    : "${TP_PEER_IP:?falta TP_PEER_IP (IP RoCE del otro rank)}"
-    : "${HOST_IP:?falta HOST_IP (IP RoCE local)}"
+    # --- 200G link: fail closed before touching NCCL --------------------------
+    # With the cable loose or the RoCE IP missing, NCCL_NET=IB does not fall
+    # back to LAN — it sits in a SILENT deadlock after the weight load. Dying
+    # here, early and with a cause, is the guarantee.
+    : "${TP_PEER_IP:?TP_PEER_IP missing (RoCE IP of the other rank)}"
+    : "${HOST_IP:?HOST_IP missing (local RoCE IP)}"
     PSTATE="$(cat "/sys/class/infiniband/$NCCL_IB_HCA/ports/1/state" 2>/dev/null || true)"
     PRATE="$(cat "/sys/class/infiniband/$NCCL_IB_HCA/ports/1/rate" 2>/dev/null || true)"
     CARRIER="$(cat "/sys/class/net/$NCCL_SOCKET_IFNAME/carrier" 2>/dev/null || true)"
     case "$PSTATE" in *ACTIVE*) ;; *)
-      echo "ABORTA: $NCCL_IB_HCA puerto 1 no esta ACTIVE (state='$PSTATE'). Cable DAC?" >&2
+      echo "ABORT: $NCCL_IB_HCA port 1 is not ACTIVE (state='$PSTATE'). DAC cable?" >&2
       exit 3 ;;
     esac
     case "$PRATE" in *200*) ;; *)
-      echo "ABORTA: $NCCL_IB_HCA no negocia 200G (rate='$PRATE')" >&2
+      echo "ABORT: $NCCL_IB_HCA does not negotiate 200G (rate='$PRATE')" >&2
       exit 3 ;;
     esac
     if [ "$CARRIER" != "1" ]; then
-      echo "ABORTA: $NCCL_SOCKET_IFNAME sin carrier (interfaz o cable caidos)" >&2
+      echo "ABORT: $NCCL_SOCKET_IFNAME has no carrier (interface or cable down)" >&2
       exit 3
     fi
     python3 - <<'PYNET'
@@ -151,15 +149,15 @@ data:
     try:
         s.connect((peer, 9))
     except OSError as e:
-        sys.exit(f"ABORTA: sin ruta al peer TP {peer}: {e}")
+        sys.exit(f"ABORT: no route to TP peer {peer}: {e}")
     src = s.getsockname()[0]
     if src != want:
-        sys.exit(f"ABORTA: el kernel enruta {peer} con source {src}, no {want}: el TP saldria por LAN")
-    print(f"ENLACE200G: peer {peer} desde {want} OK")
+        sys.exit(f"ABORT: the kernel routes {peer} with source {src}, not {want}: TP would go over the LAN")
+    print(f"LINK200G: peer {peer} from {want} OK")
     PYNET
 
-    # --- GID de RoCEv2: se resuelve de sysfs en cada arranque (deriva tras
-    # reboot/evento de enlace; un literal compartido cuelga NCCL en el init).
+    # --- RoCEv2 GID: resolved from sysfs on every boot (it drifts after a
+    # reboot/link event; a shared literal hangs NCCL during init).
     resolve_gid() {
       local hca="$1" ip="$2" a b c d suffix i v t
       IFS=. read -r a b c d <<<"$ip"
@@ -177,15 +175,15 @@ data:
       return 1
     }
     if ! NCCL_IB_GID_INDEX="$(resolve_gid "$NCCL_IB_HCA" "$HOST_IP")"; then
-      echo "ABORTA: no resuelvo el GID RoCEv2 de $NCCL_IB_HCA para $HOST_IP" >&2
+      echo "ABORT: cannot resolve the RoCEv2 GID of $NCCL_IB_HCA for $HOST_IP" >&2
       exit 1
     fi
     export NCCL_IB_GID_INDEX
     echo "NCCL: hca=$NCCL_IB_HCA if=$NCCL_SOCKET_IFNAME ip=$HOST_IP gid_index=$NCCL_IB_GID_INDEX rank=$NODE_RANK"
 
-    # --- MTP (NEXTN): conmutado, no borrado — el A/B con/sin especulacion es
-    # de una variable, y es el primer fallback si la combinacion
-    # NEXTN + hibrido GDN + FP4 resulta inestable en esta build.
+    # --- MTP (NEXTN): switchable, not removed — the A/B with/without
+    # speculation is one variable away, and it is the first fallback if the
+    # NEXTN + hybrid GDN + FP4 combination turns out unstable on this build.
     case "${ENABLE_MTP}" in
       true)
         SPEC_ARGS=(--speculative-algorithm NEXTN
@@ -199,43 +197,43 @@ data:
         echo "QWEN_SPEC_INACTIVE method=none"
         ;;
       *)
-        echo "ABORTA: ENABLE_MTP debe ser true|false (es: ${ENABLE_MTP})" >&2
+        echo "ABORT: ENABLE_MTP must be true|false (got: ${ENABLE_MTP})" >&2
         exit 4
         ;;
     esac
 
-    # Parsers opcionales: el nombre exacto depende de la build qwen4_exp. Vacio
-    # = no se pasa el flag (el server arranca y parsea en crudo) en vez de
-    # morir por un nombre de parser desconocido.
+    # Optional parsers: the exact names depend on the qwen4_exp build. Empty
+    # = the flag is not passed (the server boots and parses raw) instead of
+    # dying on an unknown parser name.
     EXTRA_ARGS=()
     if [ -n "${REASONING_PARSER:-}" ]; then EXTRA_ARGS+=(--reasoning-parser "$REASONING_PARSER"); fi
     if [ -n "${TOOL_CALL_PARSER:-}" ]; then EXTRA_ARGS+=(--tool-call-parser "$TOOL_CALL_PARSER"); fi
 
-    # 27-08: PARCHE DE IMAGEN EN CALIENTE — flash_attn_2_cuda*.so (FA2) esta
-    # compilado contra otro torch (undefined symbol c10_cuda_check_
-    # implementation) y el __init__ del paquete lo importa incondicionalmente,
-    # tumbando TAMBIEN el path cute (FA4, Python/CuTe-DSL puro) que es el que
-    # QSA necesita en sm_121 (el decode trtllm-gen no aplica: is_sm100=false).
-    # Se sustituye el __init__ por un stub minimo: el resolver de
-    # qwen_sparse_attn_backend intenta FA2 (ImportError, capturado) y cae al
-    # cute, que con el stub importa limpio — verificado en el contenedor.
-    # QUITAR cuando la imagen traiga un flash-attn compilado contra su torch.
+    # HOT IMAGE PATCH 1 — flash_attn_2_cuda*.so (FA2) in this image is built
+    # against a different torch (undefined symbol c10_cuda_check_
+    # implementation) and the package __init__ imports it unconditionally,
+    # which also kills the cute path (FA4, pure Python/CuTe-DSL) that QSA
+    # needs on sm_121 (the trtllm-gen decode does not apply: is_sm100=false).
+    # The __init__ is replaced by a minimal stub: the resolver in
+    # qwen_sparse_attn_backend tries FA2 (ImportError, caught) and falls to
+    # cute, which imports cleanly with the stub — verified in the container.
+    # REMOVE once the image ships a flash-attn built against its torch.
     FA_DIR=$(python3 -c 'import site; print(site.getsitepackages()[0])')/flash_attn
     if [ -f "$FA_DIR/__init__.py" ]; then
       printf '__version__ = "2.8.3-stub-cute-only"\n' > "$FA_DIR/__init__.py"
       rm -rf "$FA_DIR/__pycache__"
-      echo "QWEN_FA_STUB: flash_attn/__init__.py sustituido (solo path cute)"
+      echo "QWEN_FA_STUB: flash_attn/__init__.py replaced (cute path only)"
     fi
 
-    # 27-08: PARCHE 2 — el decode disperso de QSA tiene tres paths en esta
-    # imagen: FA2 (ABI rota), FA4 cute (MLIRError de congruencia al construir
-    # el kernel: "coord and shape of view are weakly congruent") y trtllm-gen
-    # via flashinfer, que es el rapido y esta capado por is_sm100_supported()
-    # == False en los GB10 (sm_121). El import de
-    # flashinfer.decode.trtllm_batch_decode_with_kv_cache funciona en esta
-    # imagen (build custom sm_121a) y con trtllm resuelto el backend no llama
-    # nunca al varlen roto (qwen_sparse_attn_backend.py:1679). Se abre el gate
-    # a sm120+. QUITAR cuando sglang upstream acepte sm120 aqui.
+    # HOT IMAGE PATCH 2 — the QSA sparse decode has three paths in this
+    # image: FA2 (broken ABI), FA4 cute (MLIRError building the kernel:
+    # "coord and shape of view are weakly congruent") and trtllm-gen via
+    # flashinfer, which is the fast one and is gated behind
+    # is_sm100_supported() == False on GB10 (sm_121). The import of
+    # flashinfer.decode.trtllm_batch_decode_with_kv_cache works in this image
+    # (custom sm_121a build) and with trtllm resolved the backend never calls
+    # the broken varlen (qwen_sparse_attn_backend.py:1679). The gate is opened
+    # to sm120+. REMOVE once sglang upstream accepts sm120 here.
     QSA_FILE=/opt/sglang/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
     python3 - "$QSA_FILE" <<'PYEOF'
     import sys
@@ -244,13 +242,12 @@ data:
     old = "    if not is_sm100_supported():"
     new = ("    from sglang.srt.utils import is_sm120_supported\n"
            "    if not (is_sm100_supported() or is_sm120_supported()):")
-    assert s.count(old) == 1, f"gate no encontrado ({s.count(old)})"
+    assert s.count(old) == 1, f"gate not found ({s.count(old)})"
     open(p, "w").write(s.replace(old, new))
-    print("QWEN_QSA_GATE: trtllm sparse decode abierto a sm120+")
+    print("QWEN_QSA_GATE: trtllm sparse decode opened to sm120+")
     PYEOF
 
-    # Un solo served-model-name: el alias `tooling` lo reescribe el hook de
-    # LiteLLM al nombre directo, igual que con DeepSeek.
+    # A single served-model-name: gateway aliases are handled upstream.
     exec python3 -m sglang.launch_server \
       --model-path "$MODEL_DIR" \
       --served-model-name qwen38-flash-next \
@@ -276,8 +273,9 @@ data:
       "${EXTRA_ARGS[@]}"
 ---
 # =============================================================================
-# RANK 0 — HEAD. gx10-ec3d (DGX2), igual que el head de DeepSeek: es el nodo
-# con mas aire y el que carga ademas servidor de API y scheduler. Unico /v1.
+# RANK 0 — HEAD. Put it on the node with more headroom: besides its rank it
+# also runs the API server and the scheduler. The only /v1.
+# Replace SPARK_HEAD / SPARK_WORKER with your two DGX Spark hostnames.
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -285,42 +283,29 @@ metadata:
   name: qwen38-flash-next-head
   namespace: llm
   labels:
-    gpu.dgx-infra/pool: gb10
-    # exclusive-2node y NO resident: el selector `role=resident` del gpu_arbiter
-    # escalaria a 0 solo el head y dejaria al worker ocupando ~100 GiB esperando
-    # un rendezvous que no llega (misma razon documentada en DeepSeek).
-    gpu.dgx-infra/role: exclusive-2node
-    gpu.dgx-infra/workload: llm
-    llm.dgx-infra/model-family: qwen38-next
+    app.kubernetes.io/part-of: qwen38-flash-next
   annotations:
-    # 0.80 * ~119.7 GiB = ~95.8 GiB de CUDA + overhead del proceso. En GB10 la
-    # memoria de GPU es memoria del sistema: este techo y el mem-cost coinciden.
-    # 26-08: con 0.85 el head (y en un intento tambien el worker) murio OOMKilled
-    # (cgroup 112Gi) 3/3 veces a los 30-90s de "Capture target verify CUDA graph
-    # begin" — el pico host-side de la compilacion inductor no cabe. 0.80 libera
-    # ~6 GiB de margen; la KV sigue cubriendo de sobra los 262K de contexto.
-    gpu.dgx-infra/mem-cost-gib: "112"
-    gpu.dgx-infra/eviction-policy: exclusive-only
-    llm.dgx-infra/profile: qwen38-flash-next-nvfp4-sglang-tp2-roce
-    # Revision pinneada el 26-08 al terminar job-download: 135.3 GB, 419
-    # ficheros, verificados 207 safetensors en el snapshot de nvidia-dgx.
-    llm.dgx-infra/model-repo: RadixArk/Qwen3.8-Flash-Next-NVFP4@7b719225242aacd3dbd3f9407468c2ee9a9d2594
-    llm.dgx-infra/quantization: >-
-      NVFP4 W4A4 solo expertos routed (294912 tensores); atencion/GDN/shared/
-      router/vision/MTP en BF16 byte-identicos; PLE n-gram FP8 en disco
-      (riesgo: dequant a BF16 al cargar — ver GO/NO-GO en cabecera)
-    llm.dgx-infra/runtime-stack: >-
-      SGLang qwen4_exp + flashinfer_cutlass FP4 sm_121a (imagen Fase 1a,
-      analysis/qwen38-flash-next-nvfp4/image/)
-    llm.dgx-infra/topology: >-
-      TP=2 entre gx10-ec3d (rank 0, 10.0.0.2) y nvidia-dgx (rank 1, 10.0.0.1)
-      sobre RoCEv2 en rocep1s0f0 / enp1s0f0np0, enlace DAC 200G directo,
-      dist-init 10.0.0.2:25100
+    # In GB10 the GPU memory IS system memory: with mem-fraction 0.85 the
+    # boot died OOMKilled 3/3 times 30-90 s into "Capture target verify CUDA
+    # graph begin" — the host-side spike of the capture-time compilation does
+    # not fit. 0.78 leaves real margin; the KV still covers the 262K context.
+    # Pinned checkpoint revision: 135.3 GB, 207 safetensors verified.
+    model-repo: RadixArk/Qwen3.8-Flash-Next-NVFP4@7b719225242aacd3dbd3f9407468c2ee9a9d2594
+    quantization: >-
+      NVFP4 W4A4 routed experts only (294912 tensors); attention/GDN/shared/
+      router/vision/MTP byte-identical BF16; n-gram PLE FP8 on disk
+      (risk: BF16 dequant on load — see the GO/NO-GO in the header)
+    topology: >-
+      TP=2 between SPARK_HEAD (rank 0, 10.0.0.2) and SPARK_WORKER (rank 1,
+      10.0.0.1) over RoCEv2, direct 200G DAC link, dist-init 10.0.0.2:25100
 spec:
-  replicas: 0
+  replicas: 1
   revisionHistoryLimit: 5
   progressDeadlineSeconds: 5400
   strategy:
+    # Recreate, and ALWAYS roll head and worker together: a rank restarting
+    # out of step with the other leaves the survivor waiting 601 s for a
+    # TCPStore rendezvous that never comes, then dying.
     type: Recreate
   selector:
     matchLabels:
@@ -328,42 +313,33 @@ spec:
   template:
     metadata:
       annotations:
-        # v3 (27-08): autotune de flashinfer RE-ACTIVADO. Se desactivo en v2
-        # porque con la JIT fria colgo el primer arranque (26-08 21:47Z, GPU
-        # 0%); con la cache de /cache/flashinfer templada arranca bien, igual
-        # que paso con DeepSeek. Si un wipe de cache lo vuelve a colgar:
-        # reponer --disable-flashinfer-autotune y bumpear esta revision.
-        config.local/launch-revision: sglang-qwen38next-20260827-v3-autotune
+        # v3: flashinfer autotune ENABLED. It was disabled for the FIRST boot
+        # because with a cold JIT cache the autotune hangs the startup (GPU
+        # 0%, scheduler spinning); with /cache/flashinfer warm it boots fine.
+        # If a cache wipe reproduces the hang: add
+        # --disable-flashinfer-autotune back and bump this revision.
+        config.local/launch-revision: sglang-qwen38next-v3-autotune
       labels:
         app: qwen38-flash-next-head
-        # litellm-dgx-backend-sync publica el alias leyendo los EndpointSlice
-        # del Service, que selecciona por esta etiqueta.
         endpoint-role: production
-        llm.dgx-infra/model-family: qwen38-next
-        # Asiento de `tooling`: el Service de pool selecciona por ESTA etiqueta.
-        # Los candidatos del asiento son fisicamente exclusivos en los Sparks,
-        # asi que el pool tiene endpoints de UNO o de NINGUNO, nunca de dos.
-        llm.dgx-infra/pool: tooling-resident
     spec:
       imagePullSecrets:
-        - name: harbor-pull
+        - name: registry-pull
       nodeSelector:
         kubernetes.io/arch: arm64
-        kubernetes.io/hostname: gx10-ec3d
+        kubernetes.io/hostname: SPARK_HEAD
       tolerations:
         - { effect: NoSchedule, key: dedicated, operator: Equal, value: llm }
       runtimeClassName: nvidia
       restartPolicy: Always
       enableServiceLinks: false
       terminationGracePeriodSeconds: 120
-      # hostNetwork obligatorio: los ranks se hablan por las IPs RoCE (10.0.0.x)
-      # del host. La red de pods no toca el fabric.
+      # hostNetwork is mandatory: the ranks talk over the host's RoCE IPs
+      # (10.0.0.x). The pod network never touches the fabric.
       hostNetwork: true
       dnsPolicy: Default
       initContainers:
         - name: verify-checkpoint
-          # FASE 1A PENDIENTE: este tag no existe aun en harbor. Replicas 0 y
-          # fuera de COMPONENTS: mergear no despliega nada.
           image: REGISTRY/sglang-qwen38next-arm64:v0.1.0
           imagePullPolicy: IfNotPresent
           command: ["python3", "/opt/qwen38next/verify_checkpoint.py"]
@@ -386,13 +362,14 @@ spec:
           securityContext:
             privileged: false
             capabilities:
-              # Fijar memoria para RDMA (equivalente k8s del memlock -1).
+              # Pin memory for RDMA (the k8s equivalent of memlock -1).
               add: ["IPC_LOCK"]
           env:
             - { name: NODE_RANK, value: "0" }
             - { name: HOST_IP, value: "10.0.0.2" }
             - { name: TP_PEER_IP, value: "10.0.0.1" }
             - { name: DIST_INIT_ADDR, value: "10.0.0.2:25100" }
+            # Adjust the HCA/interface names to your NIC.
             - { name: NCCL_IB_HCA, value: rocep1s0f0 }
             - { name: NCCL_SOCKET_IFNAME, value: enp1s0f0np0 }
             - { name: GLOO_SOCKET_IFNAME, value: enp1s0f0np0 }
@@ -409,7 +386,7 @@ spec:
             - { name: HF_HUB_OFFLINE, value: "1" }
             - { name: TRANSFORMERS_OFFLINE, value: "1" }
             - { name: HF_HUB_DISABLE_XET, value: "1" }
-            # ---- Los cuatro parametros pedidos + derivados -------------------
+            # ---- The core engine parameters ---------------------------------
             - { name: CONTEXT_LEN, value: "262144" }
             - { name: MAX_RUNNING_REQUESTS, value: "16" }
             - { name: MEM_FRACTION_STATIC, value: "0.78" }
@@ -417,34 +394,34 @@ spec:
             - { name: SPEC_STEPS, value: "3" }
             - { name: SPEC_TOPK, value: "1" }
             - { name: SPEC_DRAFT_TOKENS, value: "4" }
-            # ------------------------------------------------------------------
+            # -----------------------------------------------------------------
             - { name: FP4_GEMM_BACKEND, value: flashinfer_cutlass }
             - { name: PAGE_SIZE, value: "64" }
             - { name: MAMBA_TRACK_INTERVAL, value: "64" }
             - { name: CHUNKED_PREFILL_SIZE, value: "2048" }
-            # Cubre 16 running con margen para las formas del arbol NEXTN.
+            # Covers 16 running with margin for the NEXTN tree shapes.
             - { name: CUDA_GRAPH_MAX_BS, value: "32" }
-            # Vacios = flag ausente. Rellenar cuando la build qwen4_exp
-            # confirme los nombres (candidatos: qwen3 / qwen).
+            # Empty = flag absent. Fill in once the qwen4_exp build confirms
+            # the parser names (candidates: qwen3 / qwen).
             - { name: REASONING_PARSER, value: "" }
             - { name: TOOL_CALL_PARSER, value: "" }
-            # 27-08: acota el pico host-side de la captura de CUDA graphs. Sin
-            # esto inductor lanza ~1 worker de compilacion por core (20) y el
-            # pico de 20-40 GB mata el cgroup (112Gi) 30-90s tras "Capture
-            # begin" — paso con 0.85 y tambien con 0.80.
+            # Bounds the host-side spike of CUDA graph capture. Without this,
+            # inductor spawns ~1 compile worker per core (20) and the
+            # 20-40 GB spike kills the cgroup 30-90 s after "Capture begin".
             - { name: TORCHINDUCTOR_COMPILE_THREADS, value: "4" }
-            # 27-08: MAX_JOBS capa el ninja del JIT de flashinfer (cpp_extension).
-            # El OOM de las 00:33 fue GLOBAL del nodo nvidia-dgx, no del cgroup:
-            # dmesg muestra ~200 cicc (nvcc) paralelos como detonante sobre un
-            # nodo ya al limite (pool estatico pinneado + page cache de servir
-            # los pesos por NFS al head). Mismo modo de fallo que el 19-08.
+            # MAX_JOBS caps the ninja of the flashinfer JIT (cpp_extension).
+            # Without it the OOM is GLOBAL to the node, not the cgroup: dmesg
+            # shows ~200 parallel cicc (nvcc) processes as the trigger — a
+            # single cicc compiling the cutlass FP4 fused_moe kernels reaches
+            # 7.7 GB of RSS.
             - { name: MAX_JOBS, value: "1" }
             - { name: TORCH_CUDA_ARCH_LIST, value: "12.1a" }
             - { name: FLASHINFER_CUDA_ARCH_LIST, value: "12.1a" }
             - { name: FLASHINFER_DISABLE_VERSION_CHECK, value: "1" }
-            # Cache JIT SEPARADA de la de DeepSeek a proposito: motores y
-            # versiones distintas no deben pisarse los kernels compilados, y el
-            # rollback no debe encontrarse la cache envenenada.
+            # Keep this JIT cache SEPARATE from any other engine's on the same
+            # nodes: different engines/versions must not overwrite each
+            # other's compiled kernels, and a rollback must not find a
+            # poisoned cache.
             - { name: FLASHINFER_WORKSPACE_BASE, value: /cache/flashinfer }
             - { name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True" }
             - { name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility" }
@@ -452,8 +429,8 @@ spec:
             - { name: QWEN_REVISION, value: "7b719225242aacd3dbd3f9407468c2ee9a9d2594" }
           ports:
             - { containerPort: 8888, name: http, protocol: TCP }
-          # 120 x 30s = 60 min: ~135 GB por NFS-RDMA + captura de grafos + JIT
-          # frio de flashinfer la primera vez.
+          # 120 x 30s = 60 min: ~135 GB over NFS + graph capture + cold
+          # flashinfer JIT the first time.
           startupProbe:
             httpGet: { path: /health, port: 8888, scheme: HTTP }
             failureThreshold: 120
@@ -478,30 +455,31 @@ spec:
             - { name: infiniband, mountPath: /dev/infiniband }
             - { name: shm, mountPath: /dev/shm }
       volumes:
-        # Los pesos NO viven en gx10-ec3d: se leen por NFS-RDMA desde
-        # nvidia-dgx, igual que DeepSeek (ver k8s/hf-cache-nvidia-dgx-nfs.yaml).
+        # The weights do NOT live on the head node: they are read over NFS
+        # (ideally NFS-RDMA over the same 200G link) from the worker node.
+        # Provide your own PV/PVC or an equivalent hostPath mount.
         - name: hf-cache
-          persistentVolumeClaim: { claimName: hf-cache-nvidia-dgx-ro, readOnly: true }
+          persistentVolumeClaim: { claimName: hf-cache-ro, readOnly: true }
         - name: flashinfer-cache
-          hostPath: { path: /home/dibanez/.cache/sglang-flashinfer, type: DirectoryOrCreate }
+          hostPath: { path: /home/YOUR_USER/.cache/sglang-flashinfer, type: DirectoryOrCreate }
         - name: sglang-tmp
-          hostPath: { path: /home/dibanez/.cache/sglang-tmp, type: DirectoryOrCreate }
+          hostPath: { path: /home/YOUR_USER/.cache/sglang-tmp, type: DirectoryOrCreate }
         - name: infiniband
           hostPath: { path: /dev/infiniband, type: Directory }
         - name: launch
           configMap: { name: qwen38-flash-next-sglang-launch, defaultMode: 365 }
         - name: shared
           emptyDir: {}
-        # 16Gi: un rank por nodo, transporte NCCL sobre IB; medium:Memory
-        # cuenta contra limits.memory.
+        # 16Gi: one rank per node, NCCL transport over IB; medium:Memory
+        # counts against limits.memory.
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
 ---
 # =============================================================================
-# RANK 1 — WORKER. nvidia-dgx (DGX1). No expone API: participa en el TP por
-# NCCL. Sin Service ni probes HTTP; si muere, lo delata el startupProbe del
-# head. OJO: el hostPath de DGX1 es /home/dibanerz (errata historica del
-# usuario de ese nodo), NO /home/dibanez.
+# RANK 1 — WORKER. Does not expose an API: it participates in the TP over
+# NCCL. No Service and no HTTP probes; if it dies, the head's startupProbe
+# gives it away. ALWAYS scale it together with the head: a lone rank serves
+# nothing and sits on ~100 GiB waiting for a rendezvous that never comes.
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -509,19 +487,9 @@ metadata:
   name: qwen38-flash-next-worker
   namespace: llm
   labels:
-    gpu.dgx-infra/pool: gb10
-    gpu.dgx-infra/role: exclusive-2node
-    gpu.dgx-infra/workload: llm
-    llm.dgx-infra/model-family: qwen38-next
-  annotations:
-    gpu.dgx-infra/mem-cost-gib: "112"
-    gpu.dgx-infra/eviction-policy: exclusive-only
-    llm.dgx-infra/profile: qwen38-flash-next-nvfp4-sglang-tp2-roce
-    llm.dgx-infra/role-note: >-
-      rank 1 de un TP=2 de dos nodos. Escala SIEMPRE junto al head: un rank
-      solo no sirve nada y se queda ocupando ~100 GiB esperando el rendezvous.
+    app.kubernetes.io/part-of: qwen38-flash-next
 spec:
-  replicas: 0
+  replicas: 1
   revisionHistoryLimit: 5
   progressDeadlineSeconds: 5400
   strategy:
@@ -532,21 +500,16 @@ spec:
   template:
     metadata:
       annotations:
-        # v3 (27-08): autotune de flashinfer RE-ACTIVADO. Se desactivo en v2
-        # porque con la JIT fria colgo el primer arranque (26-08 21:47Z, GPU
-        # 0%); con la cache de /cache/flashinfer templada arranca bien, igual
-        # que paso con DeepSeek. Si un wipe de cache lo vuelve a colgar:
-        # reponer --disable-flashinfer-autotune y bumpear esta revision.
-        config.local/launch-revision: sglang-qwen38next-20260827-v3-autotune
+        # Keep in lockstep with the head's revision (see the note there).
+        config.local/launch-revision: sglang-qwen38next-v3-autotune
       labels:
         app: qwen38-flash-next-worker
-        llm.dgx-infra/model-family: qwen38-next
     spec:
       imagePullSecrets:
-        - name: harbor-pull
+        - name: registry-pull
       nodeSelector:
         kubernetes.io/arch: arm64
-        kubernetes.io/hostname: nvidia-dgx
+        kubernetes.io/hostname: SPARK_WORKER
       tolerations:
         - { effect: NoSchedule, key: dedicated, operator: Equal, value: llm }
       runtimeClassName: nvidia
@@ -601,8 +564,8 @@ spec:
             - { name: HF_HUB_OFFLINE, value: "1" }
             - { name: TRANSFORMERS_OFFLINE, value: "1" }
             - { name: HF_HUB_DISABLE_XET, value: "1" }
-            # Ambos ranks IDENTICOS en todos los parametros del motor o el TP
-            # no cuadra (misma regla que DeepSeek).
+            # Both ranks IDENTICAL in every engine parameter or the TP does
+            # not line up.
             - { name: CONTEXT_LEN, value: "262144" }
             - { name: MAX_RUNNING_REQUESTS, value: "16" }
             - { name: MEM_FRACTION_STATIC, value: "0.78" }
@@ -617,16 +580,8 @@ spec:
             - { name: CUDA_GRAPH_MAX_BS, value: "32" }
             - { name: REASONING_PARSER, value: "" }
             - { name: TOOL_CALL_PARSER, value: "" }
-            # 27-08: acota el pico host-side de la captura de CUDA graphs. Sin
-            # esto inductor lanza ~1 worker de compilacion por core (20) y el
-            # pico de 20-40 GB mata el cgroup (112Gi) 30-90s tras "Capture
-            # begin" — paso con 0.85 y tambien con 0.80.
+            # See the head for the rationale of these two.
             - { name: TORCHINDUCTOR_COMPILE_THREADS, value: "4" }
-            # 27-08: MAX_JOBS capa el ninja del JIT de flashinfer (cpp_extension).
-            # El OOM de las 00:33 fue GLOBAL del nodo nvidia-dgx, no del cgroup:
-            # dmesg muestra ~200 cicc (nvcc) paralelos como detonante sobre un
-            # nodo ya al limite (pool estatico pinneado + page cache de servir
-            # los pesos por NFS al head). Mismo modo de fallo que el 19-08.
             - { name: MAX_JOBS, value: "1" }
             - { name: TORCH_CUDA_ARCH_LIST, value: "12.1a" }
             - { name: FLASHINFER_CUDA_ARCH_LIST, value: "12.1a" }
@@ -650,12 +605,13 @@ spec:
             - { name: infiniband, mountPath: /dev/infiniband }
             - { name: shm, mountPath: /dev/shm }
       volumes:
+        # The worker node holds the single local copy of the weights.
         - name: hf-cache
-          hostPath: { path: /home/dibanerz/.cache/huggingface, type: Directory }
+          hostPath: { path: /home/YOUR_USER/.cache/huggingface, type: Directory }
         - name: flashinfer-cache
-          hostPath: { path: /home/dibanerz/.cache/sglang-flashinfer, type: DirectoryOrCreate }
+          hostPath: { path: /home/YOUR_USER/.cache/sglang-flashinfer, type: DirectoryOrCreate }
         - name: sglang-tmp
-          hostPath: { path: /home/dibanerz/.cache/sglang-tmp, type: DirectoryOrCreate }
+          hostPath: { path: /home/YOUR_USER/.cache/sglang-tmp, type: DirectoryOrCreate }
         - name: infiniband
           hostPath: { path: /dev/infiniband, type: Directory }
         - name: launch
@@ -665,45 +621,24 @@ spec:
         - name: shm
           emptyDir: { medium: Memory, sizeLimit: 16Gi }
 ---
-# Service canonico (el que consumira LiteLLM en Fase 2c). sessionAffinity como
-# DeepSeek: el radix cache vive en el head, afinidad = mas hits de prefijo.
+# Canonical Service (what your gateway consumes). sessionAffinity because the
+# radix cache lives in the head: affinity = more prefix hits.
 apiVersion: v1
 kind: Service
 metadata:
   name: qwen38-flash-next
   namespace: llm
   labels:
-    infra: "false"
-    llm.dgx-infra/model-family: qwen38-next
+    app.kubernetes.io/part-of: qwen38-flash-next
 spec:
   type: ClusterIP
-  # Selector estrecho (app + endpoint-role): un pod de benchmark clonado del
-  # deployment no puede colarse y acabar publicado por el backend-sync.
+  # Narrow selector (app + endpoint-role): a benchmark pod cloned from the
+  # deployment cannot sneak in and end up published.
   selector:
     app: qwen38-flash-next-head
     endpoint-role: production
   sessionAffinity: ClientIP
   sessionAffinityConfig:
     clientIP: { timeoutSeconds: 10800 }
-  ports:
-    - { name: http, port: 8000, targetPort: 8888, protocol: TCP }
----
-# Alias con el nombre del DEPLOYMENT, solo para el autodescubrimiento del
-# Control Nexus (sondea un Service llamado igual que el deployment; sin esto
-# pinta el modelo offline estando vivo — misma historia que DeepSeek).
-# El worker saldra offline en el HUD y es CORRECTO: no expone HTTP.
-apiVersion: v1
-kind: Service
-metadata:
-  name: qwen38-flash-next-head
-  namespace: llm
-  labels:
-    infra: "false"
-    llm.dgx-infra/model-family: qwen38-next
-spec:
-  type: ClusterIP
-  selector:
-    app: qwen38-flash-next-head
-    endpoint-role: production
   ports:
     - { name: http, port: 8000, targetPort: 8888, protocol: TCP }

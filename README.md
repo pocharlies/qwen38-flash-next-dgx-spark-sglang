@@ -11,104 +11,103 @@ tags:
   - deployment-recipe
 language:
   - en
-  - es
 ---
 
-# Qwen3.8-Flash-Next NVFP4 en 2× NVIDIA DGX Spark (GB10) con SGLang — receta completa
+# Qwen3.8-Flash-Next NVFP4 on 2× NVIDIA DGX Spark (GB10) with SGLang — full recipe
 
-Receta verificada en producción (27-08-2026) para servir
+A production-verified recipe (2026-08-27) for serving
 [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)
-(125B MoE / 6B activos + 51B PLE n-gram + 4B MTP, 135 GB) en **dos NVIDIA DGX
-Spark** con **TP=2 sobre RoCEv2** y SGLang. El checkpoint NVFP4 de RadixArk
-está validado por ellos solo en GB300/B300; **esta receta es la verificación
-en sm_121a (GB10)**.
+(125B MoE / 6B active + 51B n-gram PLE + 4B MTP, 135 GB) on **two NVIDIA DGX
+Spark** machines with **TP=2 over RoCEv2** and SGLang. The RadixArk NVFP4
+checkpoint is validated upstream only on GB300/B300; **this recipe is the
+sm_121a (GB10) verification**.
 
-## Rendimiento medido (soak de 30 min)
+## Measured performance (30-minute soak)
 
-| Métrica | Valor |
+| Metric | Value |
 |---|---|
 | Single-stream | ~41–42 tok/s |
-| 8 streams concurrentes (agregado) | **153 tok/s de media** (139–166), sin degradación |
-| Accept-length del especulativo NEXTN | ~2,3 sostenido (2,0–2,7) |
-| Térmica bajo carga sostenida | meseta 83–85 °C en ambos nodos, recuperación <60 °C |
-| Contexto | 262.144 tokens (256K nativo, sin YaRN) |
-| Concurrencia máxima | 8 (capada por la mamba cache con mem-fraction 0.78) |
+| 8 concurrent streams (aggregate) | **153 tok/s average** (139–166), no degradation |
+| NEXTN speculative accept length | ~2.3 sustained (2.0–2.7) |
+| Thermals under sustained load | 83–85 °C plateau on both nodes, recovery to <60 °C |
+| Context | 262,144 tokens (native 256K, no YaRN) |
+| Max concurrency | 8 (capped by the mamba cache at mem-fraction 0.78) |
 
 ## Hardware
 
-- 2× NVIDIA DGX Spark (GB10, 128 GB de memoria unificada LPDDR5x cada uno, arm64).
-- Enlace directo DAC 200G entre los dos, RoCEv2 (`NCCL_IB_*` en el manifiesto).
-  Sin switch: cable directo puerto a puerto y IPs estáticas (10.0.0.1/10.0.0.2).
-- Los pesos viven en uno de los nodos; el otro los lee por NFS (opcionalmente
-  NFS-RDMA sobre el mismo enlace).
+- 2× NVIDIA DGX Spark (GB10, 128 GB unified LPDDR5x each, arm64).
+- Direct 200G DAC link between the two, RoCEv2 (`NCCL_IB_*` in the manifest).
+  No switch: a straight port-to-port cable with static IPs (10.0.0.1/10.0.0.2).
+- The weights live on one node; the other reads them over NFS (optionally
+  NFS-RDMA over the same link — we measured 5.5 GB/s).
 
 ## Software
 
-- **Imagen**: `image/Dockerfile` — SGLang con la build `qwen4_exp`
+- **Image**: `image/Dockerfile` — SGLang with the `qwen4_exp` build
   (PR [sgl-project/sglang#36497](https://github.com/sgl-project/sglang/pull/36497),
-  rama `qwen4-main-squashed@73a2552`), quant `modelopt_fp4`, flashinfer con
-  kernels NVFP4 cutlass para `sm_121a`, arm64. La rama exige `cargo` (extensiones
-  Rust) — el Dockerfile instala rustup.
-- **Despliegue**: `k8s/qwen38-flash-next-nvfp4-sglang.yaml` — dos Deployments
-  (head rank 0 + worker rank 1), `hostNetwork` (los ranks se hablan por las IPs
-  del fabric RoCE), ConfigMap con el `launch.sh` completo. Todos los parámetros
-  van comentados en el propio yaml con el porqué.
+  branch `qwen4-main-squashed@73a2552`), `modelopt_fp4` quantization,
+  flashinfer with NVFP4 cutlass kernels for `sm_121a`, arm64. The branch
+  requires `cargo` (Rust extensions) — the Dockerfile installs rustup.
+- **Deployment**: `k8s/qwen38-flash-next-nvfp4-sglang.yaml` — two Deployments
+  (head rank 0 + worker rank 1), `hostNetwork` (the ranks talk over the RoCE
+  fabric IPs), and a ConfigMap with the full `launch.sh`. Every parameter is
+  commented in the yaml itself with the reasoning behind it.
 
-## Parámetros críticos (los que costaron sangre)
+## Critical parameters (the ones that cost blood)
 
-| Parámetro | Valor | Por qué |
+| Parameter | Value | Why |
 |---|---|---|
-| `--mem-fraction-static` | **0.78** | Con 0.85 el arranque muere OOM en la captura de CUDA graphs. En GB10 la memoria de GPU ES la del sistema: el pool estático pinneado + el pico de compilación host-side cruzan el límite del cgroup (y con menos margen, tumban el nodo entero). |
-| `MAX_JOBS` | **1** | El JIT de flashinfer compila los fused_moe FP4 con nvcc vía ninja, que por defecto usa todos los cores. **Un solo `cicc` de cutlass FP4 llega a 7,7 GB de RSS**: 20 en paralelo = OOM global del nodo. Con 1, el pico queda en ~8 GB. Solo afecta a la primera captura: la caché JIT persiste. |
-| `TORCHINDUCTOR_COMPILE_THREADS` | 4 | Acota los workers de compilación de inductor durante la captura. |
-| `--page-size` | 64 | Obligatorio: QSA (atención dispersa) trabaja en micro-bloques de 64. |
-| `--mamba-scheduler-strategy extra_buffer` + `--mamba-track-interval 64` | — | Obligatorios para el radix cache sobre el estado GDN híbrido. |
-| MTP NEXTN | steps=3, topk=1, draft=4 | Accept-length medido ~2,3. Conmutable con `ENABLE_MTP=false` sin tocar la imagen. |
-| `--chunked-prefill-size` | 2048 | Un prefill largo hunde los decodes concurrentes en este hardware. |
-| `--disable-flashinfer-autotune` | solo el PRIMER arranque | Con la JIT fría, el autotune cuelga el arranque (GPU 0%, spin). Con la caché templada se puede re-activar (no medimos diferencia de rendimiento, pero arranca limpio). |
-| Límite de memoria del pod | 112Gi de ~120 GiB | Deja aire al sistema. El OOM que importa aquí es el GLOBAL del nodo, no el del cgroup — ningún cgroup te protege del page cache + memoria unificada. |
+| `--mem-fraction-static` | **0.78** | With 0.85 the boot dies OOM during CUDA graph capture. On GB10 the GPU memory IS system memory: the pinned static pool plus the host-side compilation spike cross the cgroup limit (and with less margin, they take down the whole node). |
+| `MAX_JOBS` | **1** | The flashinfer JIT compiles the FP4 fused_moe kernels with nvcc via ninja, which defaults to one job per core. **A single cutlass FP4 `cicc` reaches 7.7 GB of RSS**: 20 in parallel = global node OOM. With 1, the spike stays around ~8 GB. Only the first capture is affected: the JIT cache persists. |
+| `TORCHINDUCTOR_COMPILE_THREADS` | 4 | Bounds inductor's compile workers during capture. |
+| `--page-size` | 64 | Mandatory: QSA (sparse attention) works in 64-token micro-blocks. |
+| `--mamba-scheduler-strategy extra_buffer` + `--mamba-track-interval 64` | — | Mandatory for the radix cache over the hybrid GDN state. |
+| NEXTN MTP | steps=3, topk=1, draft=4 | Measured accept length ~2.3. Switchable with `ENABLE_MTP=false` without touching the image. |
+| `--chunked-prefill-size` | 2048 | A long prefill sinks concurrent decodes on this hardware. |
+| `--disable-flashinfer-autotune` | FIRST boot only | With a cold JIT cache the autotune hangs the startup (GPU at 0%, spinning). Once the cache is warm it can be re-enabled (we measured no performance difference, but it boots cleanly). |
+| Pod memory limit | 112Gi out of ~120 GiB | Leaves air for the system. The OOM that matters here is the GLOBAL node one, not the cgroup one — no cgroup protects you from page cache plus unified memory. |
 
-## Los dos parches en caliente (launch.sh)
+## The two hot patches (launch.sh)
 
-La imagen construida desde la rama abierta trae dos minas que el `launch.sh`
-del ConfigMap parchea antes del `exec` (buscar `QWEN_FA_STUB` y
-`QWEN_QSA_GATE` en el yaml):
+The image built from the open branch ships two landmines that the ConfigMap's
+`launch.sh` patches before `exec` (search for `QWEN_FA_STUB` and
+`QWEN_QSA_GATE` in the yaml):
 
-1. **flash-attn FA2 con ABI rota** (símbolo `c10_cuda_check_implementation` sin
-   resolver contra el torch de la imagen) y su `__init__.py` lo importa
-   incondicionalmente, tumbando también el path cute de FA4. El parche stubea
-   el `__init__` para que solo viva el path cute.
-2. **El path cute de FA4 revienta igualmente** (MLIRError de congruencia en
-   nvidia_cutlass_dsl al construir el kernel varlen). La salida real: el decode
-   disperso de QSA tiene un tercer path, **trtllm-gen vía flashinfer**, capado
-   por `is_sm100_supported()` que excluye a los GB10 (sm_121). El parche abre
-   el gate a sm120+ — con trtllm resuelto, el backend no llama nunca al varlen
-   roto. (Relacionado: sgl-project/sglang#36531.)
+1. **flash-attn FA2 with a broken ABI** (unresolved symbol
+   `c10_cuda_check_implementation` against the image's torch) whose
+   `__init__.py` imports it unconditionally, killing the FA4 cute path too.
+   The patch stubs the `__init__` so only the cute path survives.
+2. **The FA4 cute path crashes anyway** (an MLIRError about shape congruence
+   in nvidia_cutlass_dsl while building the varlen kernel). The real way out:
+   QSA's sparse decode has a third path, **trtllm-gen via flashinfer**, gated
+   behind `is_sm100_supported()`, which excludes GB10 (sm_121). The patch
+   opens the gate to sm120+ — with trtllm resolved, the backend never calls
+   the broken varlen. (Related: sgl-project/sglang#36531.)
 
-Cuando la imagen se reconstruya con un flash-attn compilado contra su torch y
-el gate corregido upstream, ambos parches sobran.
+Once the image is rebuilt with a flash-attn compiled against its torch and the
+gate is fixed upstream, both patches become unnecessary.
 
-## Go/no-go de memoria: el PLE
+## Memory go/no-go: the PLE
 
-Las tablas PLE n-gram (51 GB) van FP8 en disco. La ficha de RadixArk dice que
-se decuantizan a BF16 al cargar (lo que no cabría); **medido en sm_121a: se
-quedan en FP8** — ~74 GiB de pesos por rank, y sobra pool para 262K de
-contexto. Verifícalo en tu arranque: `Load weight end ... avail mem` debe
-dejar ~33-35 GB.
+The n-gram PLE tables (51 GB) are FP8 on disk. The RadixArk model card says
+they dequantize to BF16 on load (which would not fit); **measured on sm_121a:
+they stay FP8** — ~74 GiB of weights per rank, with plenty of pool left for
+the 262K context. Verify it on your boot: `Load weight end ... avail mem`
+should leave ~33–35 GB.
 
-## Gotchas operativos
+## Operational gotchas
 
-- **Los dos ranks siempre juntos**: si uno reinicia descompasado, el otro se
-  queda 601 s esperando el rendezvous del TCPStore y muere. Reinicia ambos a
-  la vez (Recreate coordinado).
-- La primera petición tras un arranque tarda ~10-60 s (warmup). No está caído.
-- Si el nodo que sirve los pesos por NFS hace además I/O pesado durante el
-  arranque, el otro rank puede quedarse clavado en `folio_wait_bit_common`
-  (tormenta de reclaim del page cache). Evita descargas grandes concurrentes.
-- Las métricas salen con prefijo `sglang:*` (incluye `sglang:spec_accept_length`
-  para vigilar el especulativo).
+- **Both ranks always together**: if one restarts out of step, the other
+  waits 601 s for the TCPStore rendezvous and dies. Restart both at once
+  (coordinated Recreate).
+- The first request after a boot takes ~10–60 s (warmup). It is not down.
+- If the node serving the weights over NFS also does heavy I/O during boot,
+  the other rank can get stuck in `folio_wait_bit_common` (a page-cache
+  reclaim storm). Avoid large concurrent downloads.
+- Metrics come with the `sglang:*` prefix (including
+  `sglang:spec_accept_length` to watch the speculative decoding).
 
-## Troubleshooting completo
+## Full troubleshooting
 
-El catálogo de todos los modos de fallo que nos comimos (con su diagnóstico y
-fix) está en [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
+The catalogue of every failure mode we hit (with diagnosis and fix) is in
+[`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).

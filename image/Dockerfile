@@ -1,61 +1,61 @@
-# sglang-qwen38next-arm64 — SGLang para Qwen3.8-Flash-Next NVFP4 en DGX Spark
-# (GB10 = sm_121a, aarch64). Destino:
+# sglang-qwen38next-arm64 — SGLang for Qwen3.8-Flash-Next NVFP4 on NVIDIA DGX
+# Spark (GB10 = sm_121a, aarch64). Target:
 #   REGISTRY/sglang-qwen38next-arm64:v0.1.0
-# que es el tag que referencia k8s-ai-pocharlies/k8s/qwen38-flash-next-nvfp4-sglang.yaml.
+# which is the tag referenced by k8s/qwen38-flash-next-nvfp4-sglang.yaml.
 #
-# ESTADO UPSTREAM (comprobado 26-08-2026 con gh):
-#   - El soporte del modelo es el PR sgl-project/sglang#36497 "Introduce
-#     Qwen 3.8 Flash Next" — ABIERTO, rama in-repo `qwen4-main-squashed`,
-#     head 73a2552. NO esta en main: se construye desde esa rama y se
-#     RE-PINNEA al SHA de merge cuando entre.
-#   - Cookbook oficial ya mergeado (PR #36496, docs) apuntando a ese PR.
-#   - MINAS ABIERTAS que nos afectan directamente (revisar estado antes del
-#     primer arranque y en cada re-pin):
-#       #36531  QSA elige un camino FA4 de pip incompatible en SM120
-#               (vecino directo de nuestro sm_121: es el riesgo nº1)
-#       #36532  conflicto de dtype del estado GDN prefill/decode en SM120
-#       #36514  feature: offload del PLE n-gram — ES nuestro go/no-go de
-#               memoria (PLE FP8 vs dequant a BF16); si avanza, seguirlo
-#       #36537  thinking + tool parser qwen3_coder entra en bucle con token 0
-#               -> razon por la que TOOL_CALL_PARSER va VACIO en el manifiesto
+# UPSTREAM STATE (checked 2026-08-26 with gh):
+#   - Model support is PR sgl-project/sglang#36497 "Introduce Qwen 3.8 Flash
+#     Next" — OPEN, in-repo branch `qwen4-main-squashed`, head 73a2552. NOT in
+#     main yet: build from that branch and RE-PIN to the merge SHA once it
+#     lands.
+#   - The official cookbook is already merged (PR #36496, docs) pointing at
+#     that PR.
+#   - OPEN LANDMINES that affect this recipe directly (check their state
+#     before the first boot and on every re-pin):
+#       #36531  QSA picks an incompatible pip FA4 path on SM120
+#               (direct neighbour of our sm_121: risk #1 — this recipe's
+#               launch.sh works around it, see the QSA gate patch)
+#       #36532  GDN state dtype conflict prefill/decode on SM120
+#       #36514  feature: n-gram PLE offload — this IS the memory go/no-go
+#               (PLE FP8 vs BF16 dequant); track it
+#       #36537  thinking + qwen3_coder tool parser loops on token 0
+#               -> the reason TOOL_CALL_PARSER is EMPTY in the manifest
 #
-# REQUISITOS QUE ESTA IMAGEN TIENE QUE CUMPLIR (gate de la Fase 1a):
-#   1. Arquitectura `qwen4_exp` cargando (PR #36497).
-#   2. Quantization `modelopt_fp4` con backend `flashinfer_cutlass` en sm_121a.
-#      El checkpoint RadixArk esta validado solo en GB300/B300; sm_121 es
-#      NUESTRA verificacion. Precedente: el build de vLLM de DeepSeek ya
-#      compila flashinfer/CuTeDSL para 12.1a en estos nodos.
-#   3. aarch64 (Grace). Construir en un Spark o runner ARC arm64; nada de
-#      buildx+qemu para kernels CUDA.
+# REQUIREMENTS THIS IMAGE MUST MEET:
+#   1. The `qwen4_exp` architecture loads (PR #36497).
+#   2. Quantization `modelopt_fp4` with the `flashinfer_cutlass` backend on
+#      sm_121a. The RadixArk checkpoint is validated upstream only on
+#      GB300/B300; sm_121 is OUR verification.
+#   3. aarch64 (Grace). Build on a Spark or an arm64 runner; do not use
+#      buildx+qemu for CUDA kernels.
 #
-# TODO(fase 1a) antes de considerarla lista:
-#   - Confirmar imagen base (candidatos: la de los playbooks DGX Spark de NGC,
-#     o nvcr.io/nvidia/pytorch:<25.xx>-py3). En Docker Hub lmsysorg/sglang NO
-#     hay tags aarch64 (comprobado 26-08).
-#   - flashinfer: wheel/build con kernels NVFP4 CUTLASS para sm_121a, y ojo a
-#     #36531/#36532 (los caminos QSA/GDN en SM12x).
-#   - Ejecutar el smoke del final en un GB10 y guardar la salida junto al PR.
+# TODO before considering it final:
+#   - Confirm the base image (candidates: the NGC DGX Spark playbook images,
+#     or nvcr.io/nvidia/pytorch:<25.xx>-py3). Docker Hub lmsysorg/sglang has
+#     NO aarch64 tags (checked 2026-08-26).
+#   - flashinfer: wheel/build with NVFP4 CUTLASS kernels for sm_121a, and
+#     mind #36531/#36532 (the QSA/GDN paths on SM12x).
+#   - Run the smoke test at the end on a GB10 and keep the output.
 #
-# Build (en un GB10; es CPU-bound pero clona/descarga varios GB — misma
-# disciplina de ventana que cualquier descarga en esos nodos):
+# Build (on a GB10; it is CPU-bound but clones/downloads several GB):
 #   docker build -t REGISTRY/sglang-qwen38next-arm64:v0.1.0 .
 #   docker push REGISTRY/sglang-qwen38next-arm64:v0.1.0
 
-# TODO(fase 1a): confirmar tag base (25.08-py3 es placeholder razonable:
-# CUDA 13 + torch aarch64; los playbooks de Spark pueden traer uno mejor).
+# TODO: confirm the base tag (25.08-py3 is a reasonable placeholder: CUDA 13 +
+# aarch64 torch; the Spark playbooks may ship a better one).
 FROM nvcr.io/nvidia/pytorch:25.08-py3
 
-# Head del PR #36497 (rama qwen4-main-squashed) a 26-08-2026. RE-PINNEAR al
-# SHA de merge cuando el PR entre en main.
+# Head of PR #36497 (branch qwen4-main-squashed) as of 2026-08-26. RE-PIN to
+# the merge SHA once the PR lands in main.
 ARG SGLANG_COMMIT=73a255206f916366c8d26d4022f82ddfb0ab558d
-ARG FLASHINFER_REF=TODO-pinnear
+ARG FLASHINFER_REF=TODO-pin
 
 ENV TORCH_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_CUDA_ARCH_LIST=12.1a \
     FLASHINFER_DISABLE_VERSION_CHECK=1
 
-# La rama qwen4-main-squashed trae extensiones Rust (/opt/sglang/rust) y su
-# setup.py exige cargo para descubrirlas y compilarlas (fallo medido 26-08:
+# The qwen4-main-squashed branch ships Rust extensions (/opt/sglang/rust) and
+# its setup.py requires cargo to discover and build them (measured failure:
 # "RuntimeError: cargo is required to discover the Rust extension modules").
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
@@ -65,13 +65,13 @@ RUN git clone https://github.com/sgl-project/sglang.git /opt/sglang \
     && git checkout "${SGLANG_COMMIT}" \
     && pip install --no-cache-dir -e "python[all]"
 
-# TODO(fase 1a): flashinfer con NVFP4 para sm_121a si el que arrastra sglang
-# no lo trae (mismo camino que el build de vLLM de DeepSeek).
+# TODO: flashinfer with NVFP4 for sm_121a if the one sglang pulls in does not
+# ship it.
 # RUN pip install --no-cache-dir "flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer@${FLASHINFER_REF}"
 
-# Smoke de build: si la arquitectura o el quant method no estan, el build
-# muere aqui y no llega un tag roto a harbor. (El smoke de kernels FP4 reales
-# necesita GPU: ejecutarlo aparte en un GB10.)
+# Build smoke test: if the architecture or the quant method is missing, the
+# build dies here and a broken tag never reaches the registry. (The real FP4
+# kernel smoke test needs a GPU: run it separately on a GB10.)
 RUN python3 - <<'PY'
 import sglang
 print("sglang", sglang.__version__)
@@ -79,10 +79,10 @@ from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 assert "modelopt_fp4" in QUANTIZATION_METHODS, sorted(QUANTIZATION_METHODS)
 print("modelopt_fp4 OK")
 import importlib
-# La arquitectura del checkpoint (config.json architectures) tiene que
-# resolver en el registry de modelos de esta build.
+# The checkpoint architecture (config.json architectures) must resolve in
+# this build's model registry.
 from sglang.srt.models.registry import ModelRegistry
 archs = getattr(ModelRegistry, "models", None) or {}
 assert any("qwen" in a.lower() and ("4" in a or "next" in a.lower()) for a in archs), sorted(archs)[:40]
-print("registro de modelos con qwen4/next OK")
+print("qwen4/next model registry OK")
 PY

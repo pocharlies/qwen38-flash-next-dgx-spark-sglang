@@ -1,102 +1,104 @@
-# Catálogo de fallos de arranque (todos vividos, con fix)
+# Boot failure catalogue (all of them lived through, with fixes)
 
-Cronología real de una noche de puesta en producción en 2× DGX Spark. Cada
-fallo destapó el siguiente. Si tu arranque falla, busca aquí el síntoma.
+The real chronology of one night bringing this up on 2× DGX Spark. Each
+failure uncovered the next. If your boot fails, look up the symptom here.
 
-## 1. OOMKilled (exit 137) a los 30–90 s de «Capture target verify CUDA graph begin»
+## 1. OOMKilled (exit 137) 30–90 s after "Capture target verify CUDA graph begin"
 
-**Síntoma**: el head (o el worker) muere justo al empezar la captura de CUDA
-graphs. Los pesos cargaron bien, la KV está asignada.
+**Symptom**: the head (or the worker) dies right as CUDA graph capture
+starts. The weights loaded fine, the KV cache was allocated.
 
-**Causa**: en GB10 la memoria de GPU es memoria del sistema. El pool estático
-(`mem-fraction-static` × ~120 GiB) está pinneado, y la compilación que dispara
-la captura añade un pico host-side que cruza el límite.
+**Cause**: on GB10 the GPU memory is system memory. The static pool
+(`mem-fraction-static` × ~120 GiB) is pinned, and the compilation triggered
+by the capture adds a host-side spike that crosses the limit.
 
-**Fix**: `mem-fraction-static` 0.78 (no 0.85) + ver fallo 2.
+**Fix**: `mem-fraction-static` 0.78 (not 0.85) + see failure 2.
 
-## 2. El OOM es GLOBAL del nodo, no del cgroup
+## 2. The OOM is GLOBAL to the node, not the cgroup
 
-**Síntoma**: `dmesg` muestra `cicc invoked oom-killer` y el task dump lista
-procesos de sistema (systemd, nfsd...). Cientos de procesos `cicc`.
+**Symptom**: `dmesg` shows `cicc invoked oom-killer` and the task dump lists
+system processes (systemd, nfsd...). Hundreds of `cicc` processes.
 
-**Causa**: el JIT de flashinfer compila los kernels fused_moe FP4 con nvcc vía
-ninja **sin -j** → un compilador por core. **Un solo `cicc` de cutlass FP4
-llega a 7,7 GB de RSS.** 20 en paralelo sobre un nodo con el pool pinneado =
-OOM global. El límite de memoria del pod NO protege de esto.
+**Cause**: the flashinfer JIT compiles the FP4 fused_moe kernels with nvcc
+via ninja **without -j** → one compiler per core. **A single cutlass FP4
+`cicc` reaches 7.7 GB of RSS.** 20 in parallel on a node with the pool pinned
+= global OOM. The pod memory limit does NOT protect against this.
 
-**Fix**: `MAX_JOBS=1` (lo honra torch cpp_extension/ninja). La primera captura
-es lenta (nvcc en serie) pero la caché JIT persiste en un hostPath y los
-siguientes arranques no compilan. Dimensiona el startupProbe a 60 min.
+**Fix**: `MAX_JOBS=1` (honoured by torch cpp_extension/ninja). The first
+capture is slow (serial nvcc) but the JIT cache persists on a hostPath and
+subsequent boots do not compile. Size the startupProbe for 60 minutes.
 
-## 3. Un rank clavado en `folio_wait_bit_common` (D-state, GPU 0 %)
+## 3. One rank stuck in `folio_wait_bit_common` (D-state, GPU at 0%)
 
-**Síntoma**: un rank se queda >20 min entre «Mamba Cache is allocated» y la KV
-(paso que tarda 6 s). `ps -eLo ... wchan` muestra el scheduler en estado D en
-`folio_wait_bit_common`.
+**Symptom**: a rank sits >20 min between "Mamba Cache is allocated" and the
+KV allocation (a step that takes 6 s). `ps -eLo ... wchan` shows the
+scheduler thread in D state at `folio_wait_bit_common`.
 
-**Causa**: tormenta de reclaim del page cache — el nodo servía a la vez los
-135 GB de pesos por NFS al otro rank y/o tenía I/O pesado concurrente.
+**Cause**: a page-cache reclaim storm — the node was simultaneously serving
+the 135 GB of weights over NFS to the other rank and/or doing heavy
+concurrent I/O.
 
-**Fix**: no programar descargas/I/O masivo en los nodos durante el arranque.
-Si ya está clavado, no se recupera solo: reinicio coordinado de ambos ranks.
+**Fix**: do not schedule downloads/massive I/O on the nodes during boot. If
+it is already wedged, it does not recover on its own: coordinated restart of
+both ranks.
 
-## 4. «Timed out after 601 seconds waiting for clients. 1/2 clients joined»
+## 4. "Timed out after 601 seconds waiting for clients. 1/2 clients joined"
 
-**Síntoma**: el head muere con ese timeout del TCPStore; el worker muestra
-`Broken pipe` contra el head. Suele pasar tras cualquier crash de un rank.
+**Symptom**: the head dies with that TCPStore timeout; the worker shows
+`Broken pipe` against the head. Usually happens after any single-rank crash.
 
-**Causa**: los dos ranks reiniciaron descompasados y el rendezvous quedó roto.
+**Cause**: the two ranks restarted out of step and the rendezvous broke.
 
-**Fix**: reinicio coordinado (Recreate de ambos a la vez). Diseña el deploy
-para que nunca reinicie uno solo.
+**Fix**: coordinated restart (Recreate of both at once). Design the
+deployment so a single rank never restarts alone.
 
 ## 5. ImportError: undefined symbol `c10_cuda_check_implementation` (flash_attn)
 
-**Síntoma**: la captura muere en `_resolve_flash_attn_varlen_func` con un
-undefined symbol al importar `flash_attn_2_cuda*.so`.
+**Symptom**: the capture dies in `_resolve_flash_attn_varlen_func` with an
+undefined symbol while importing `flash_attn_2_cuda*.so`.
 
-**Causa**: el wheel de flash-attn (FA2) de la imagen está compilado contra
-otro torch (ABI rota), y el `__init__.py` del paquete lo importa siempre —
-tumba también el path cute (FA4) que es Python puro.
+**Cause**: the image's flash-attn (FA2) wheel is built against a different
+torch (broken ABI), and the package `__init__.py` always imports it — which
+also kills the cute path (FA4), the pure-Python one.
 
-**Fix temporal**: stubear `flash_attn/__init__.py` (ver `QWEN_FA_STUB` en el
-launch.sh). Fix real: reconstruir la imagen con flash-attn compilado contra su
-torch.
+**Temporary fix**: stub `flash_attn/__init__.py` (see `QWEN_FA_STUB` in
+launch.sh). Real fix: rebuild the image with a flash-attn compiled against
+its torch.
 
-## 6. MLIRError: «coord and shape of view are weakly congruent» (cutlass DSL)
+## 6. MLIRError: "coord and shape of view are weakly congruent" (cutlass DSL)
 
-**Síntoma**: con el stub anterior, la captura muere construyendo el kernel
-varlen cute de FA4 en `nvidia_cutlass_dsl`.
+**Symptom**: with the stub above, the capture dies building the FA4 cute
+varlen kernel in `nvidia_cutlass_dsl`.
 
-**Causa**: el kernel cute no es compatible con las shapes que le pasa QSA en
-este stack. Es la mina de sgl-project/sglang#36531 (QSA elige camino FA4
-incompatible en SM120/121).
+**Cause**: the cute kernel is incompatible with the shapes QSA feeds it on
+this stack. This is the landmine of sgl-project/sglang#36531 (QSA picks an
+incompatible FA4 path on SM120/121).
 
-**Fix**: abrir el gate del decode trtllm de QSA a sm120+ (ver `QWEN_QSA_GATE`
-en el launch.sh): `is_sm100_supported()` excluye a los GB10 pero el
-`flashinfer.decode.trtllm_batch_decode_with_kv_cache` de la build sm_121a
-funciona; con trtllm resuelto el backend nunca llama al varlen.
+**Fix**: open QSA's trtllm decode gate to sm120+ (see `QWEN_QSA_GATE` in
+launch.sh): `is_sm100_supported()` excludes GB10, but
+`flashinfer.decode.trtllm_batch_decode_with_kv_cache` from the sm_121a build
+works; with trtllm resolved the backend never calls the varlen.
 
-## 7. El autotune de flashinfer cuelga el PRIMER arranque
+## 7. The flashinfer autotune hangs the FIRST boot
 
-**Síntoma**: 20+ min tras el arranque, GPU al 0 %, scheduler en spin, sin
-progreso de captura.
+**Symptom**: 20+ minutes after startup, GPU at 0%, scheduler spinning, no
+capture progress.
 
-**Causa**: autotune + caché JIT fría.
+**Cause**: autotune + cold JIT cache.
 
-**Fix**: `--disable-flashinfer-autotune` en el primer arranque; cuando la
-caché está templada se puede re-activar (arranca limpio; no medimos mejora).
+**Fix**: `--disable-flashinfer-autotune` on the first boot; once the cache is
+warm it can be re-enabled (boots cleanly; we measured no performance gain).
 
-## 8. La primera petición tarda un minuto
+## 8. The first request takes a minute
 
-No está caído: es warmup (shapes fuera de los graphs capturados, JIT
-residual). La segunda petición ya va a velocidad normal. Si tu healthcheck
-hace inferencia real, dale margen.
+It is not down: it is warmup (shapes outside the captured graphs, residual
+JIT). The second request runs at normal speed. If your healthcheck performs
+real inference, give it slack.
 
-## Verificación de que todo fue bien
+## Verifying a good boot
 
-- `Load weight end ... avail mem=33-35 GB` por rank → el PLE quedó en FP8 (GO).
-- `/health` 200 en el head, ambos ranks estables sin reinicios.
-- `sglang:spec_accept_length` ~2,0-2,7 bajo carga (si es ~1,0 el MTP no
-  especula).
-- 8 concurrentes ≈ 150 tok/s agregado; single-stream ≈ 40.
+- `Load weight end ... avail mem=33-35 GB` per rank → the PLE stayed FP8 (GO).
+- `/health` returns 200 on the head, both ranks stable with no restarts.
+- `sglang:spec_accept_length` at ~2.0–2.7 under load (if it is ~1.0, MTP is
+  not speculating).
+- 8 concurrent streams ≈ 150 tok/s aggregate; single-stream ≈ 40.
