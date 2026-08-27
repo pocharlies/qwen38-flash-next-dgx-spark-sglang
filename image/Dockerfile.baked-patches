@@ -1,0 +1,31 @@
+# v0.2.0 — base image with the two former launch-time patches BAKED IN.
+# File edits only: no compilation, builds in seconds on top of v0.1.0.
+# Once upstream ships a flash-attn built against the image's torch and
+# accepts sm120 in the QSA trtllm gate (sgl-project/sglang#36531), this
+# layer disappears.
+FROM REGISTRY/sglang-qwen38next-arm64:v0.1.0
+
+# Patch 1 baked: the FA2 flash-attn wheel has a broken ABI against the
+# image's torch and the package __init__ imports it unconditionally, which
+# also kills the FA4 cute path QSA needs. Minimal stub: only cute survives.
+RUN python3 - <<'PY'
+import site, os, shutil
+fa = os.path.join(site.getsitepackages()[0], "flash_attn")
+with open(os.path.join(fa, "__init__.py"), "w") as f:
+    f.write("__version__ = \"2.8.3-stub-cute-only\"\n")
+shutil.rmtree(os.path.join(fa, "__pycache__"), ignore_errors=True)
+print("flash_attn stubbed")
+PY
+
+# Patch 2 baked: QSA's trtllm sparse-decode gate excluded GB10 (sm_121);
+# open it to sm120+ so the backend never touches the broken varlen path.
+RUN python3 - <<'PY'
+p = "/opt/sglang/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py"
+s = open(p).read()
+old = "    if not is_sm100_supported():"
+new = ("    from sglang.srt.utils import is_sm120_supported\n"
+       "    if not (is_sm100_supported() or is_sm120_supported()):")
+assert s.count(old) == 1, s.count(old)
+open(p, "w").write(s.replace(old, new))
+print("QSA gate opened to sm120+")
+PY

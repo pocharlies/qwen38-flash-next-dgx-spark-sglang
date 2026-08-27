@@ -70,7 +70,67 @@ sm_121a (GB10) verification**.
 | `--disable-flashinfer-autotune` | FIRST boot only | With a cold JIT cache the autotune hangs the startup (GPU at 0%, spinning). Once the cache is warm it can be re-enabled (we measured no performance difference, but it boots cleanly). |
 | Pod memory limit | 112Gi out of ~120 GiB | Leaves air for the system. The OOM that matters here is the GLOBAL node one, not the cgroup one — no cgroup protects you from page cache plus unified memory. |
 
-## The two hot patches (launch.sh)
+## Concurrency vs context: the real tuning axis (measured)
+
+The KV cache of this model is almost free (12 KB/token/rank: only 12 of 48
+layers carry KV -- the whole pool at fraction 0.78 was ~4.4 GB), while the
+mamba/GDN state costs ~0.5 GB per concurrent request (5 slots/request with
+NEXTN x ~0.1 GB/slot). The KV pool has no direct knob: it is the remainder
+`fraction x 120 - weights(74) - mamba - graphs`, so you steer it with
+`--mem-fraction-static` and `--max-mamba-cache-size` (always identical on
+both ranks). Three configurations measured on the same pair of Sparks:
+
+| Config | Concurrency | KV pool | Aggregate | Per stream |
+|---|---|---|---|---|
+| 0.78 / mamba auto | 8 | 365K tok | 153 tok/s | 19.7 |
+| 0.80 / mamba 80 | 16 | 212K tok | 223 tok/s | 14.8 |
+| 0.85 / mamba 30 (long-agent profile) | 6 | **1.02M tok** | 124 tok/s | 22.8 |
+
+**Always check `max_total_num_tokens` in the boot log after touching either
+knob**: one intermediate config left the KV pool at 67K tokens -- below the
+262K context -- and long agent sessions silently stopped fitting.
+
+Large-context concurrency on the 6cc/1M profile (prefix-cache-friendly
+corpus, so treat prefill figures as upper bounds):
+
+| Load | Total prompt tokens | Wall | Aggregate prefill |
+|---|---|---|---|
+| 6 x ~30K | 198K | 25.9 s | 7.7K tok/s |
+| 4 x ~60K | 264K | 22.4 s | **11.8K tok/s** |
+| 2 x ~120K | 264K | 34.9 s | 7.6K tok/s |
+
+A cold 72K-token single prompt (no prefix reuse) prefills in ~29 s
+(~2.5K tok/s).
+
+## Why not vLLM (yet)
+
+There is an [official vLLM recipe](https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next)
+for this model. We evaluated it and stayed on SGLang for this hardware:
+
+- **The FP8 checkpoint is 172.8 GiB** (~86.4 GiB/rank on TP2). Our NVFP4
+  checkpoint is ~74 GiB/rank -- and on 128 GB unified-memory boxes that
+  12 GiB difference is the whole safety margin. vLLM does not load the
+  RadixArk experts-only NVFP4 layout, so with vLLM you are forced onto FP8.
+- **The PLE CPU-offload flag buys nothing on GB10**: `VLLM_PLE_CPU_OFFLOAD`
+  moves the 51 GB n-gram table "to host RAM" -- on unified memory that IS
+  the same LPDDR. It only helps on discrete-GPU systems (GB300/H200).
+- **The recipe is validated single-node only** (GB300, 8x H200, MI355X) and
+  n-gram embedding does not support pipeline parallelism; two-Spark TP over
+  RoCE with the PLE would be unexplored territory again.
+- Independent validation is welcome though: the vLLM recipe also disables
+  flashinfer autotune, uses 3 speculative tokens, and hits the same
+  mamba-cache capacity wall -- three of our hard-won conclusions, reproduced.
+
+If an official NVFP4 checkpoint that vLLM loads ever ships, it is worth
+re-evaluating: vLLM on these Sparks is otherwise well-trodden ground.
+
+## Running without Kubernetes (plain docker run)
+
+`run/head.sh` and `run/worker.sh` reproduce the whole deployment with plain
+`docker run` on the two Sparks -- same image, same NCCL/RoCE environment,
+same engine flags, with the boot-order and GID-resolution notes inline.
+
+## The two former hot patches -- now baked into the image
 
 The image built from the open branch ships two landmines that the ConfigMap's
 `launch.sh` patches before `exec` (search for `QWEN_FA_STUB` and
@@ -87,8 +147,10 @@ The image built from the open branch ships two landmines that the ConfigMap's
    opens the gate to sm120+ — with trtllm resolved, the backend never calls
    the broken varlen. (Related: sgl-project/sglang#36531.)
 
-Once the image is rebuilt with a flash-attn compiled against its torch and the
-gate is fixed upstream, both patches become unnecessary.
+Both patches are now BAKED into the image as build layers (v0.2.0, see
+`image/Dockerfile.baked-patches`): the launch script is clean again. The
+definitive fix is still upstream (a flash-attn wheel built against the
+image's torch, and sglang accepting sm120 in the gate).
 
 ## Memory go/no-go: the PLE
 
