@@ -42,11 +42,11 @@ docker run --rm --name qwen38-head \
     --fp4-gemm-backend flashinfer_cutlass \
     --page-size 64 \
     --mamba-scheduler-strategy extra_buffer --mamba-track-interval 64 \
-    --max-mamba-cache-size 30 \
+    --max-mamba-cache-size 40 \
     --chunked-prefill-size 2048 \
-    --max-running-requests 6 \
+    --max-running-requests 8 \
     --context-length 262144 \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static 0.90 \
     --cuda-graph-max-bs 32 \
     --speculative-algorithm NEXTN --speculative-num-steps 3 \
     --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
@@ -56,6 +56,9 @@ docker run --rm --name qwen38-head \
 #   --disable-flashinfer-autotune
 # (autotune hangs with a cold cache) and expect up to ~60 min of weight load
 # + CUDA graph capture. Warm boots take ~6-9 min.
-# NOTE on tuning: mem-fraction 0.85 + mamba 30 = 6 concurrent / ~1M-token KV
-# pool (long-agent profile). See the README table for the 8cc and 16cc
+# NOTE on tuning: mem-fraction 0.90 + mamba 40 = 8 concurrent / ~1.37M-token
+# KV pool (long-agent profile: ~5 full 262K sessions in parallel), with
+# ~7 GB node headroom and flashinfer autotune ON. Do NOT go above 0.90 with
+# autotune enabled: 0.94 reaches ~1.7M KV but leaves 2 GB and hangs the
+# autotune (no buffer memory). See the README table for the 16cc and 6cc
 # trade-offs. Both ranks must use IDENTICAL engine parameters.

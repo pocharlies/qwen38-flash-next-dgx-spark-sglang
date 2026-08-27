@@ -37,11 +37,11 @@ docker run --rm --name qwen38-worker \
     --fp4-gemm-backend flashinfer_cutlass \
     --page-size 64 \
     --mamba-scheduler-strategy extra_buffer --mamba-track-interval 64 \
-    --max-mamba-cache-size 30 \
+    --max-mamba-cache-size 40 \
     --chunked-prefill-size 2048 \
-    --max-running-requests 6 \
+    --max-running-requests 8 \
     --context-length 262144 \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static 0.90 \
     --cuda-graph-max-bs 32 \
     --speculative-algorithm NEXTN --speculative-num-steps 3 \
     --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \

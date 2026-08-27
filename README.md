@@ -34,7 +34,7 @@ sm_121a (GB10) verification**.
 | NEXTN speculative accept length | ~2.3 sustained (2.0–2.7) |
 | Thermals under sustained load | 83–85 °C plateau on both nodes, recovery to <60 °C |
 | Context | 262,144 tokens (native 256K, no YaRN) |
-| Max concurrency | 8 (capped by the mamba cache at mem-fraction 0.78) |
+| Concurrency / KV | tunable trade-off; shipping 8 concurrent / ~1.37M-token KV pool (see the config table) |
 
 ## Hardware
 
@@ -60,7 +60,7 @@ sm_121a (GB10) verification**.
 
 | Parameter | Value | Why |
 |---|---|---|
-| `--mem-fraction-static` | **0.78** | With 0.85 the boot dies OOM during CUDA graph capture. On GB10 the GPU memory IS system memory: the pinned static pool plus the host-side compilation spike cross the cgroup limit (and with less margin, they take down the whole node). |
+| `--mem-fraction-static` | **0.90** (shipping) | Steers the KV pool (see the config table). Early on, 0.85 OOM'd during CUDA graph capture — but that was the nvcc/inductor spike, now capped by `MAX_JOBS=1`; with it capped, 0.90 boots clean and 0.94 is the hard edge. On GB10 the GPU memory IS system memory: the pinned static pool plus the host-side compilation spike cross the cgroup limit (and with less margin, they take down the whole node). |
 | `MAX_JOBS` | **1** | The flashinfer JIT compiles the FP4 fused_moe kernels with nvcc via ninja, which defaults to one job per core. **A single cutlass FP4 `cicc` reaches 7.7 GB of RSS**: 20 in parallel = global node OOM. With 1, the spike stays around ~8 GB. Only the first capture is affected: the JIT cache persists. |
 | `TORCHINDUCTOR_COMPILE_THREADS` | 4 | Bounds inductor's compile workers during capture. |
 | `--page-size` | 64 | Mandatory: QSA (sparse attention) selects at micro-block level, 64-token blocks with a budget of 512 blocks / 2048 tokens per query (model card). |
@@ -80,11 +80,22 @@ NEXTN x ~0.1 GB/slot). The KV pool has no direct knob: it is the remainder
 `--mem-fraction-static` and `--max-mamba-cache-size` (always identical on
 both ranks). Three configurations measured on the same pair of Sparks:
 
-| Config | Concurrency | KV pool | Aggregate | Per stream |
-|---|---|---|---|---|
-| 0.78 / mamba auto | 8 | 365K tok | 153 tok/s | 19.7 |
-| 0.80 / mamba 80 | 16 | 212K tok | 223 tok/s | 14.8 |
-| 0.85 / mamba 30 (long-agent profile) | 6 | **1.02M tok** | 124 tok/s | 22.8 |
+| Config | Concurrency | KV pool | Aggregate | Per stream | Node headroom |
+|---|---|---|---|---|---|
+| 0.78 / mamba auto | 8 | 365K tok | 153 tok/s | 19.7 | ~24 GB |
+| 0.86 / mamba 80 | 16 | 737K tok | 160 tok/s | 10.2 | ~11 GB |
+| 0.85 / mamba 30 | 6 | 1.02M tok | 124 tok/s | 22.8 | ~15 GB |
+| **0.90 / mamba 40 (SHIPPING)** | **8** | **1.37M tok** | -- | -- | ~7 GB |
+| 0.94 / mamba 40 (the edge, not recommended) | 8 | 1.70M tok | -- | -- | ~2 GB |
+
+The **shipping config is 0.90 / 8 concurrent / ~1.37M-token KV pool** (~5 full
+262K sessions in parallel) with flashinfer autotune ON and ~7 GB of node
+headroom. It boots clean in ~8 min.
+
+**0.90 is the ceiling with autotune enabled.** 0.94 does reach a ~1.7M KV pool
+but leaves the node with 2 GB, which hangs the flashinfer autotune (no buffer
+memory) for ~27 min and drags CUDA graph capture out to ~25 min; it only boots
+with `--disable-flashinfer-autotune`. Not worth the fragility.
 
 **Always check `max_total_num_tokens` in the boot log after touching either
 knob**: one intermediate config left the KV pool at 67K tokens -- below the
